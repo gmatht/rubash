@@ -176,6 +176,38 @@ impl Executor {
         self.host_external_command_handler = Some(HostExternalCommandHandler(Box::new(handler)));
     }
 
+    /// Install an embedder-supplied provider for **piped** stages.
+    ///
+    /// Use this rather than [`Executor::set_host_external_command_handler`]
+    /// when piped stages must run against the embedder's own implementation:
+    /// the external hook is not consulted for a pipeline's non-final stages,
+    /// and this shell answers `cat`/`wc`/`grep`/`sed`/`sort`/`head`/`tail`/`uniq`
+    /// internally before any external dispatch. See [`HostPipelineStage`].
+    pub fn set_host_pipeline_stage_provider<F>(&mut self, provider: F)
+    where
+        F: FnMut(&[String], &HashMap<String, String>) -> Option<Box<dyn HostPipelineStage>>
+            + 'static,
+    {
+        self.host_pipeline_stage_provider =
+            Some(HostPipelineStageProvider(Box::new(provider)));
+    }
+
+    /// Whether an embedder has installed a piped-stage provider.
+    pub fn has_host_pipeline_stage_provider(&self) -> bool {
+        self.host_pipeline_stage_provider.is_some()
+    }
+
+    /// Ask the embedder for a resumable stage, if a provider is installed.
+    pub(in crate::executor) fn host_pipeline_stage(
+        &mut self,
+        words: &[String],
+        env_vars: &HashMap<String, String>,
+    ) -> Option<Box<dyn HostPipelineStage>> {
+        self.host_pipeline_stage_provider
+            .as_mut()
+            .and_then(|p| (p.0)(words, env_vars))
+    }
+
     #[cfg(windows)]
     pub fn set_elevation_handler<F>(&mut self, handler: F)
     where

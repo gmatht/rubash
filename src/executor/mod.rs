@@ -234,6 +234,45 @@ pub struct HostExternalCommandOutput {
     pub status: i32,
 }
 
+/// A **resumable pipeline stage** supplied by the embedder.
+///
+/// [`Executor::set_host_external_command_handler`] is consulted only for
+/// commands that reach external dispatch, and never for a pipeline's non-final
+/// stages or for the utilities this shell implements inline (`cat`, `wc`,
+/// `grep`, `sed`, `sort`, head/tail, uniq). An embedder that wants piped stages
+/// to run against its own implementation installs a provider here instead:
+/// when it returns `Some`, that stage is driven to completion and the inline and
+/// external paths are both bypassed.
+pub trait HostPipelineStage: Send {
+    /// One resumable step.
+    ///
+    /// * `input` — bytes available from upstream this round (may be empty while
+    ///   upstream is still producing),
+    /// * `eof` — upstream has closed, so an empty `input` means end of stream.
+    ///
+    /// Returns `(wrote, done)`: bytes to emit downstream now, and
+    /// `Some(status)` once the stage has finished.
+    fn step(&mut self, input: &[u8], eof: bool) -> (Vec<u8>, Option<i32>);
+
+    /// Human-readable name, for diagnostics.
+    fn name(&self) -> &str {
+        "(host stage)"
+    }
+}
+
+/// Builds a [`HostPipelineStage`] for one command, if the embedder wants it.
+type HostPipelineStageFn =
+    dyn FnMut(&[String], &HashMap<String, String>) -> Option<Box<dyn HostPipelineStage>>;
+
+/// Newtype carrying a `Debug` impl so the executor keeps `#[derive(Debug)]`.
+struct HostPipelineStageProvider(Box<HostPipelineStageFn>);
+
+impl std::fmt::Debug for HostPipelineStageProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostPipelineStageProvider(..)")
+    }
+}
+
 struct HostExternalCommandHandler(
     Box<dyn FnMut(&[String], &HashMap<String, String>) -> Option<HostExternalCommandOutput>>,
 );
@@ -649,6 +688,8 @@ pub struct Executor {
     stdout_capture: Option<Vec<u8>>,
     stderr_capture: Option<Vec<u8>>,
     host_external_command_handler: Option<HostExternalCommandHandler>,
+    /// Embedder-supplied resumable implementations for piped stages.
+    host_pipeline_stage_provider: Option<HostPipelineStageProvider>,
     #[cfg(windows)]
     elevation_handler: Option<ElevationHandler>,
     external_file_builtins_enabled: bool,

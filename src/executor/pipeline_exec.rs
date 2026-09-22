@@ -984,11 +984,121 @@ impl Executor {
         Ok(Some(results))
     }
 
+    /// Drive a pipeline through **embedder-supplied resumable stages**.
+    ///
+    /// This is the pipeline-interface bridge: this shell already models a
+    /// pipeline as "each stage is handed the previous stage's stdout", so the
+    /// bridge is a left-to-right loop over stages, each fed what the previous one
+    /// wrote. Every stage the provider claims runs entirely inside the embedder;
+    /// one it declines falls back to the normal per-stage dispatcher, so partial
+    /// coverage works. Returns `Ok(None)` when nothing is claimed, so the caller
+    /// falls through to the regular machinery.
+    fn execute_host_pipeline_interface(
+        &mut self,
+        commands: &[&CommandNode],
+    ) -> Result<Option<Vec<(String, String, i32)>>, ExecuteError> {
+        let mut planned: Vec<Option<Box<dyn HostPipelineStage>>> =
+            Vec::with_capacity(commands.len());
+        let mut claimed_any = false;
+
+        for command in commands {
+            let words: Vec<String> = command
+                .words
+                .iter()
+                .enumerate()
+                .map(|(index, word)| self.expand_word(word))
+                .collect();
+            let env_vars = self.env_vars.clone();
+            let stage = if words.is_empty() {
+                None
+            } else {
+                self.host_pipeline_stage(&words, &env_vars)
+            };
+            if stage.is_some() {
+                claimed_any = true;
+            }
+            planned.push(stage);
+        }
+
+        if !claimed_any {
+            return Ok(None);
+        }
+
+        let mut input = self.initial_pipeline_input(commands[0]);
+        let mut results: Vec<(String, String, i32)> = Vec::with_capacity(commands.len());
+
+        for (index, command) in commands.iter().enumerate() {
+            if let Some(mut stage) = planned[index].take() {
+                // Buffer-then-run per stage: the upstream bytes are the stage's
+                // whole input. The first round feeds them; once consumed the next
+                // round is the EOF round that flushes a buffering stage.
+                let mut pending = input.as_bytes().to_vec();
+                let mut eof = pending.is_empty();
+                let mut out = String::new();
+                let mut status = 0i32;
+                let mut guard = 0usize;
+
+                loop {
+                    guard += 1;
+                    if guard > 100_000 {
+                        return Err(ExecuteError::UnknownBuiltin(format!(
+                            "host pipeline stage '{}' did not terminate",
+                            stage.name()
+                        )));
+                    }
+                    let (wrote, done) = stage.step(&pending, eof);
+                    if !wrote.is_empty() {
+                        out.push_str(
+                            &crate::executor::substitution_metadata::bytes_to_shell_text(&wrote),
+                        );
+                    }
+                    pending.clear();
+                    eof = true;
+                    if let Some(code) = done {
+                        status = code;
+                        break;
+                    }
+                }
+
+                results.push((out.clone(), String::new(), status));
+                input = out;
+            } else {
+                let Some((out, err, status)) =
+                    self.execute_pipeline_stage(command, &input, false)?
+                else {
+                    return Ok(None);
+                };
+                results.push((out.clone(), err, status));
+                input = out;
+            }
+        }
+
+        // The caller returns as soon as this reports `Some`, so the final
+        // stage's stdout must be written here, exactly as the regular concurrent
+        // path does at its own tail.
+        self.write_pipeline_output(
+            commands[commands.len() - 1],
+            &results.last().map(|r| r.0.clone()).unwrap_or_default(),
+        )?;
+
+        Ok(Some(results))
+    }
+
     #[cfg(not(windows))]
     fn execute_external_pipeline_concurrently(
         &mut self,
         commands: &[&CommandNode],
     ) -> Result<Option<Vec<(String, String, i32)>>, ExecuteError> {
+        // Embedder-supplied resumable stages: run the pipeline through the
+        // **pipeline interface** rather than this shell's own stage machinery.
+        // It must sit here because this function answers `cat f | wc` *before*
+        // the per-stage dispatcher, and therefore before the inline
+        // `cat`/`wc`/`grep`/`sed` fast paths that would otherwise hide the stage
+        // from any host.
+        if self.host_pipeline_stage_provider.is_some() {
+            return self.execute_host_pipeline_interface(commands);
+        }
+
         if commands.len() < 2
             || self.stderr_capture.is_some()
             // GNU runs each pipeline element's run_debug_trap inside the

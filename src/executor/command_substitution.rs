@@ -726,6 +726,7 @@ impl Executor {
             stdout_capture: None,
             stderr_capture: None,
             host_external_command_handler: None,
+            host_pipeline_stage_provider: None,
             #[cfg(windows)]
             elevation_handler: None,
             external_file_builtins_enabled: self.external_file_builtins_enabled,
